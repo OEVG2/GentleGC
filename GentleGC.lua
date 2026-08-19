@@ -1,21 +1,38 @@
 local gentleGC = CreateFrame("FRAME")
 
-local gc_count = 1
+-- Collection and reporting run on independent timers.
+local GC_INTERVAL     = 15   -- seconds between garbage collections (keeps memory clean)
+local REPORT_INTERVAL = 300  -- seconds between chat reports (5 minutes)
 
-ggc_debug = true
+ggc_debug = true             -- set false to silence reports entirely
+
+local gc_elapsed      = 0
+local report_elapsed  = 0
+local gc_count        = 0    -- collections since last report
+local freed_kb        = 0    -- memory freed (KB) since last report
 
 gentleGC:SetScript("OnUpdate", function ()
-  this.elapsed = (this.elapsed or 0) + arg1
-  if this.elapsed > 60 then
-    local x,d1 = gcinfo(),GetTime()
-    -- print("gc "..gc_count.." "..x/1024.."mb / "..y/1024.."mb")
-    collectgarbage()
-    local y,d2 = gcinfo(),GetTime()
-    if ggc_debug then
-      print(format("%d sec gc %d, was %.1fmb, is %.1fmb, saved %.1fmb, took %.2fs",60,gc_count,x/1024,y/1024,(x-y)/1024, d2 - d1))
-    end
+  gc_elapsed     = gc_elapsed     + arg1
+  report_elapsed = report_elapsed + arg1
 
+  -- Run collection on the short interval, silently.
+  if gc_elapsed > GC_INTERVAL then
+    local before = gcinfo()
+    collectgarbage()
+    local after = gcinfo()
+    freed_kb = freed_kb + (before - after)
     gc_count = gc_count + 1
-    this.elapsed = 0
+    gc_elapsed = 0
+  end
+
+  -- Report only on the long interval.
+  if report_elapsed > REPORT_INTERVAL then
+    if ggc_debug then
+      print(format("GentleGC: %d collections in last %d min, freed %.1fmb, now %.1fmb",
+        gc_count, REPORT_INTERVAL / 60, freed_kb / 1024, gcinfo() / 1024))
+    end
+    gc_count       = 0
+    freed_kb       = 0
+    report_elapsed = 0
   end
 end)
