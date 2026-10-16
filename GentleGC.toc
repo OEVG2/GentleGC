@@ -1,7 +1,8 @@
 ## Interface: 11200
 ## Title: Gentle GC
-## Notes: Run garbage collection without pause-the-world allocation
-## Author: Weird Vibes
-## Version: 1.0
+## Notes: Schedules Lua garbage collection for moments you won't notice
+## Author: Weird Vibes (MarcelineVQ); forks by TheRealFayz, jrc13245
+## Version: 2.0
+## SavedVariables: GentleGCDB
 
 GentleGC.lua
