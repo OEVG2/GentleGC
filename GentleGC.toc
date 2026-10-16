@@ -2,7 +2,7 @@
 ## Title: Gentle GC
 ## Notes: Schedules Lua garbage collection for moments you won't notice
 ## Author: Weird Vibes (MarcelineVQ); forks by TheRealFayz, jrc13245
-## Version: 2.1
+## Version: 2.2
 ## SavedVariables: GentleGCDB
 
 GentleGC.lua

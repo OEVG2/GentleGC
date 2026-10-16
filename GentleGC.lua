@@ -23,6 +23,9 @@
   optional, used only when the ClassicAPI client mod is installed:
     * collect when you've been standing still for a few seconds (GetUnitSpeed)
     * run the once-a-second check from C_Timer instead of a frame OnUpdate
+  diagnostics:
+    * /ggc hitch: report frames that take too long, and whether a garbage
+      collection (ours, the game's, or another addon's) happened in them
 ]]
 
 local ADDON = "GentleGC"
@@ -37,6 +40,7 @@ local DEFAULTS = {
   combatHeadroomMB = 32,   -- extra room before auto-GC during combat (0 = off)
   reportInterval   = 300,  -- seconds between debug summaries
   stillSeconds     = 3,    -- ClassicAPI only: collect after standing still this long (0 = off)
+  hitchMs          = 0,    -- freeze detector: report frames longer than this (0 = off)
 }
 
 local db = {}
@@ -65,8 +69,12 @@ local tick, reportElapsed = 0, 0
 local hasSpeed, hasTicker = false, false   -- ClassicAPI features, detected at load
 local stillFor, lastCheck = 0, 0
 local loadTime = 0                         -- the idle fallback counts from login
+-- for the freeze detector: counters, because GetTime() only ticks every ~15ms
+local ownCollectSeq, ownCollectMs, ownCollectReason = 0, 0, nil
+local ownThresholdSeq = 0                  -- bumped when we change the threshold without collecting
 local EnterCombatThreshold    -- defined below, used by Sync()
 local StartScheduler          -- defined below, called on ADDON_LOADED
+local HitchLoading, HitchEnable -- freeze detector, defined below
 
 local function NewStats() return { count = 0, freed = 0, skipped = 0, ms = 0, worst = 0, auto = 0, autoCombat = 0 } end
 local period, total = NewStats(), NewStats()
@@ -92,9 +100,9 @@ local function ResetStats(s)
 end
 
 -- Wall-clock timing. debugprofilestop() has ms precision but resets a timer
--- other addons may use, so it is only touched while debugging.
+-- other addons may use, so it is only touched while debugging or detecting freezes.
 local function StartTimer()
-  if DebugLevel() > 0 and debugprofilestart then
+  if (DebugLevel() > 0 or db.hitchMs > 0) and debugprofilestart then
     debugprofilestart()
     return nil
   end
@@ -162,6 +170,7 @@ local function Collect(reason)
   knownThreshold = threshold
   lastGC = GetTime()
   savedThreshold = nil           -- collectgarbage() already set a fresh threshold
+  ownCollectSeq, ownCollectMs, ownCollectReason = ownCollectSeq + 1, ms, reason
 
   local freed = before - after
   for _, s in ipairs({ period, total }) do
@@ -206,6 +215,7 @@ EnterCombatThreshold = function()
     collectgarbage(want)         -- raising the threshold never triggers a collection
     local _, t = gcinfo()
     knownThreshold = t
+    ownThresholdSeq = ownThresholdSeq + 1
   end
 end
 
@@ -230,6 +240,7 @@ local function LeaveCombat()
     savedThreshold = nil
     local _, t = gcinfo()
     knownThreshold = t
+    ownThresholdSeq = ownThresholdSeq + 1
   end
 end
 
@@ -268,12 +279,14 @@ frame:SetScript("OnEvent", function()
     if arg1 ~= ADDON then return end
     ApplyDefaults()
     StartScheduler()
+    HitchEnable()
     frame:UnregisterEvent("ADDON_LOADED")
   elseif event == "PLAYER_REGEN_DISABLED" then
     EnterCombat()
   elseif event == "PLAYER_REGEN_ENABLED" then
     LeaveCombat()
   elseif event == "PLAYER_LEAVING_WORLD" or event == "PLAYER_ENTERING_WORLD" then
+    HitchLoading(event == "PLAYER_LEAVING_WORLD")
     inCombat = UnitAffectingCombat("player") and true or false
     TryCollect("loading screen", true)
   elseif event == "PLAYER_FLAGS_CHANGED" then
@@ -349,6 +362,107 @@ StartScheduler = function()
 end
 
 ---------------------------------------------------------------------------
+-- freeze detector (/ggc hitch)
+--
+-- Runs on its own frame's OnUpdate, only while enabled. Each frame it reads
+-- the clock and gcinfo() (no allocation). When the gap since the previous
+-- frame exceeds the limit, it reports what happened inside that gap:
+--   * a GentleGC collection (with its measured duration)
+--   * a collection we didn't run: the game's automatic GC, or another
+--     addon calling collectgarbage() (detected by the heap shrinking or
+--     the threshold changing)
+--   * no collection at all: the freeze came from something else
+-- plus how much Lua memory was allocated during it and which frame was
+-- under the mouse (the window being dragged, usually).
+---------------------------------------------------------------------------
+
+local hitchFrame = CreateFrame("Frame")
+local hPrevTime, hPrevUsed, hPrevThreshold = 0, 0, 0
+local hPrevCollectSeq, hPrevThresholdSeq = 0, 0
+local hLoading, hSkip = false, 0
+local hitchLog = {}   -- last 10 freezes, newest last
+local HITCH_LOG_SIZE = 10
+
+local function FocusName()
+  if not GetMouseFocus then return nil end
+  local f = GetMouseFocus()
+  if not f or not f.GetName then return nil end
+  local name = f:GetName()
+  -- walk up to the first named ancestor for anonymous child frames
+  local depth = 0
+  while not name and f.GetParent and depth < 10 do
+    f = f:GetParent()
+    if not f or not f.GetName then break end
+    name = f:GetName()
+    depth = depth + 1
+  end
+  return name
+end
+
+local function HitchReset()
+  hPrevTime = GetTime()
+  hPrevUsed, hPrevThreshold = gcinfo()
+  hPrevCollectSeq, hPrevThresholdSeq = ownCollectSeq, ownThresholdSeq
+end
+
+local function HitchOnUpdate()
+  local now = GetTime()
+  local used, threshold = gcinfo()
+  local gap = now - hPrevTime
+  local prevUsed, prevThreshold = hPrevUsed, hPrevThreshold
+  local weCollected = ownCollectSeq ~= hPrevCollectSeq
+  local weMovedThreshold = ownThresholdSeq ~= hPrevThresholdSeq
+  hPrevTime, hPrevUsed, hPrevThreshold = now, used, threshold
+  hPrevCollectSeq, hPrevThresholdSeq = ownCollectSeq, ownThresholdSeq
+
+  if hLoading then return end
+  if hSkip > 0 then hSkip = hSkip - 1; return end
+  if gap * 1000 < db.hitchMs then return end
+
+  local cause
+  if weCollected then
+    cause = format("GentleGC collection (%s) took %dms", ownCollectReason or "?", ownCollectMs)
+  elseif used < prevUsed - 256 or (threshold ~= prevThreshold and not weMovedThreshold) then
+    cause = format("garbage collection not run by GentleGC (game's automatic GC or another addon's collectgarbage): heap %.1fmb -> %.1fmb",
+      MB(prevUsed), MB(used))
+  else
+    cause = "no garbage collection - something else caused it"
+  end
+
+  local grew = used - prevUsed
+  local alloc = ""
+  if grew > 1024 then alloc = format("; %.1fmb of Lua memory allocated during it", MB(grew)) end
+  local focus = FocusName()
+  local where = focus and ("; mouse over " .. focus) or ""
+  local combat = inCombat and " (in combat)" or ""
+
+  local line = format("freeze %.2fs%s: %s%s%s", gap, combat, cause, alloc, where)
+  Msg("|cffff8888" .. line .. "|r")
+
+  table.insert(hitchLog, format("%s %s", date and date("%H:%M:%S") or format("%.0f", now), line))
+  if table.getn(hitchLog) > HITCH_LOG_SIZE then table.remove(hitchLog, 1) end
+end
+
+-- loading screens are long "frames" by design; ignore them
+HitchLoading = function(leaving)
+  hLoading = leaving
+  if not leaving then
+    hSkip = 3
+    HitchReset()
+  end
+end
+
+HitchEnable = function()
+  if db.hitchMs > 0 then
+    HitchReset()
+    hSkip = 1
+    hitchFrame:SetScript("OnUpdate", HitchOnUpdate)
+  else
+    hitchFrame:SetScript("OnUpdate", nil)
+  end
+end
+
+---------------------------------------------------------------------------
 -- /ggc
 ---------------------------------------------------------------------------
 
@@ -374,6 +488,7 @@ local function PrintStatus()
   Msg(format("debug=%d interval=%ds maxinterval=%ds garbage=%dmb garbagepct=%d%% pressure=%d%% headroom=%dmb report=%ds still=%ds",
     DebugLevel(), db.minInterval, db.maxInterval, db.minGarbageMB, db.minGarbagePct,
     db.pressurePct, db.combatHeadroomMB, db.reportInterval, db.stillSeconds))
+  Msg(db.hitchMs > 0 and ("freeze detector: on (" .. db.hitchMs .. "ms)") or "freeze detector: off (/ggc hitch)")
   Msg("ClassicAPI: stand-still " .. (hasSpeed and "on" or "not available") ..
     ", C_Timer " .. (hasTicker and "on" or "not available (using OnUpdate)"))
 end
@@ -392,14 +507,31 @@ SlashCmdList["GENTLEGC"] = function(msg)
     db.debug = n
     ggc_debug = nil
     Msg("debug " .. n .. (n == 0 and " (off)" or n == 1 and " (summaries)" or " (every collection)"))
+  elseif cmd == "hitch" then
+    local n = tonumber(val)
+    if n == nil then n = (db.hitchMs > 0) and 0 or 250 end
+    db.hitchMs = n
+    HitchEnable()
+    if n > 0 then
+      Msg("freeze detector on: reporting frames longer than " .. n .. "ms (/ggc hitch 0 to stop)")
+    else
+      Msg("freeze detector off")
+    end
+  elseif cmd == "hitches" then
+    if table.getn(hitchLog) == 0 then
+      Msg(db.hitchMs > 0 and "no freezes recorded this session" or "freeze detector is off - /ggc hitch to turn it on")
+    else
+      for _, l in ipairs(hitchLog) do Msg(l) end
+    end
   elseif cmd == "reset" then
     for k, v in pairs(DEFAULTS) do db[k] = v end
+    HitchEnable()
     Msg("settings reset to defaults")
   elseif OPTIONS[cmd] and tonumber(val) then
     db[OPTIONS[cmd]] = tonumber(val)
     Msg(cmd .. " = " .. val)
   else
-    Msg("/ggc [status] | now | debug [0-2] | reset")
+    Msg("/ggc [status] | now | debug [0-2] | hitch [ms] | hitches | reset")
     Msg("/ggc interval|maxinterval|report|still <sec>  garbage|headroom <mb>  garbagepct|pressure <%>")
   end
 end

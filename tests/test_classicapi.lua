@@ -12,12 +12,13 @@ DEFAULT_CHAT_FRAME = { AddMessage = function(_, m) table.insert(log, m); print("
 SlashCmdList = {}
 local tickerFn, tickerPeriod
 C_Timer = { NewTicker = function(p, f) tickerPeriod, tickerFn = p, f; return {} end }
-local F
+FRAMES = {}
 function CreateFrame()
-  F = { scripts = {} }
+  local F = { scripts = {} }
   function F:RegisterEvent() end
   function F:UnregisterEvent() end
   function F:SetScript(k, f) self.scripts[k] = f end
+  table.insert(FRAMES, F)
   return F
 end
 local function fire(e, a1) event, arg1 = e, a1; F.scripts.OnEvent() end
@@ -31,6 +32,8 @@ local function check(name, c) print((c and "PASS " or "FAIL ") .. name); if not 
 
 collectgarbage()
 dofile(arg[1])
+F = FRAMES[1]
+HF = FRAMES[2]
 fire("ADDON_LOADED", "GentleGC")
 SlashCmdList.GENTLEGC("debug 2")
 

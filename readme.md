@@ -1,4 +1,4 @@
-Gentle Garbage Collection — unified edition (v2.1)
+Gentle Garbage Collection — unified edition (v2.2)
 ---
 For OctoWoW and other Turtle WoW–based 1.12 clients (Lua 5.0).
 
@@ -36,6 +36,17 @@ moments you won't notice.
   collection off), `/ggc reset`.
 - The old `/run ggc_debug = 1` still works.
 
+**Freeze detector** (off by default)
+- `/ggc hitch` reports any frame that takes longer than 250 ms (`/ggc hitch 500`
+  sets a different limit, `/ggc hitch 0` turns it off). Each report says
+  whether a garbage collection happened in that frame and whose it was:
+  GentleGC's (with how long it took), the game's automatic one or another
+  addon's, or none at all. It also gives how much Lua memory was allocated
+  during the freeze and which window was under the mouse.
+- `/ggc hitches` lists the last 10 freezes.
+- Loading screens are ignored. While on, the detector reads the clock and
+  memory counter once per frame and allocates nothing.
+
 The best way to shorten the pauses themselves is still to run less addon memory.
 pfQuest, for example, can hold 100 MB while idle.
 
@@ -47,8 +58,8 @@ pfQuest, for example, can hold 100 MB while idle.
   collection off in combat, and the next build removed that.
 
 **Tests** (`tests/`) run on stock Lua 5.0 with stubbed game functions:
-`lua5.0 tests/test_stock.lua GentleGC.lua` (likewise `test_classicapi.lua`
-and `test_combat_auto.lua`). The game never loads them.
+`lua5.0 tests/test_stock.lua GentleGC.lua` (likewise `test_classicapi.lua`,
+`test_combat_auto.lua` and `test_hitch.lua`). The game never loads them.
 
 Credits: original by MarcelineVQ (Weird Vibes). Event-driven collection from
 jrc13245's fork; separate report timer from TheRealFayz's fork.

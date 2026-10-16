@@ -8,12 +8,13 @@ function UnitIsAFK() return afk end
 local log = {}
 DEFAULT_CHAT_FRAME = { AddMessage = function(self, m) table.insert(log, m); print("  chat: " .. m) end }
 SlashCmdList = {}
-local F
+FRAMES = {}
 function CreateFrame()
-  F = { scripts = {}, events = {} }
+  local F = { scripts = {}, events = {} }
   function F:RegisterEvent(e) self.events[e] = true end
   function F:UnregisterEvent(e) self.events[e] = nil end
   function F:SetScript(k, f) self.scripts[k] = f end
+  table.insert(FRAMES, F)
   return F
 end
 local function fire(e, a1)
@@ -36,6 +37,8 @@ end
 
 collectgarbage()
 dofile(arg[1])
+F = FRAMES[1]
+HF = FRAMES[2]
 fire("ADDON_LOADED", "GentleGC")
 local cmd = SlashCmdList.GENTLEGC
 cmd("debug 2")
