@@ -20,6 +20,9 @@
     * raise the threshold for the duration of combat so the automatic
       collector is pushed to after the fight, then restore it
     * saved settings and a /ggc slash command
+  optional, used only when the ClassicAPI client mod is installed:
+    * collect when you've been standing still for a few seconds (GetUnitSpeed)
+    * run the once-a-second check from C_Timer instead of a frame OnUpdate
 ]]
 
 local ADDON = "GentleGC"
@@ -33,6 +36,7 @@ local DEFAULTS = {
   pressurePct      = 85,   -- out of combat: collect early once heap reaches this % of threshold
   combatHeadroomMB = 32,   -- extra room before auto-GC during combat (0 = off)
   reportInterval   = 300,  -- seconds between debug summaries
+  stillSeconds     = 3,    -- ClassicAPI only: collect after standing still this long (0 = off)
 }
 
 local db = {}
@@ -58,7 +62,11 @@ do
   knownThreshold = threshold
 end
 local tick, reportElapsed = 0, 0
+local hasSpeed, hasTicker = false, false   -- ClassicAPI features, detected at load
+local stillFor, lastCheck = 0, 0
+local loadTime = 0                         -- the idle fallback counts from login
 local EnterCombatThreshold    -- defined below, used by Sync()
+local StartScheduler          -- defined below, called on ADDON_LOADED
 
 local function NewStats() return { count = 0, freed = 0, skipped = 0, ms = 0, worst = 0, auto = 0, autoCombat = 0 } end
 local period, total = NewStats(), NewStats()
@@ -169,13 +177,15 @@ local function Collect(reason)
   end
 end
 
--- reason: label for debug output
+-- reason:         label for debug output
 -- ignoreInterval: true for moments where a pause is free (loading screen)
 --                 or urgent (heap about to trigger the automatic collector)
-local function TryCollect(reason, ignoreInterval)
+-- silent:         don't count a skip (periodic checks retry every second)
+local function TryCollect(reason, ignoreInterval, silent)
   if inCombat then return end
   if not ignoreInterval and GetTime() - lastGC < db.minInterval then return end
   if not WorthCollecting() then
+    if silent then return end
     period.skipped = period.skipped + 1
     total.skipped = total.skipped + 1
     return
@@ -257,6 +267,7 @@ frame:SetScript("OnEvent", function()
   if event == "ADDON_LOADED" then
     if arg1 ~= ADDON then return end
     ApplyDefaults()
+    StartScheduler()
     frame:UnregisterEvent("ADDON_LOADED")
   elseif event == "PLAYER_REGEN_DISABLED" then
     EnterCombat()
@@ -272,21 +283,28 @@ frame:SetScript("OnEvent", function()
   end
 end)
 
--- Fallback: once a second, out of combat only.
-frame:SetScript("OnUpdate", function()
-  tick = tick + arg1
-  if tick < 1 then return end
-  reportElapsed = reportElapsed + tick
-  tick = 0
-
+-- Once-a-second check: auto-GC detection, pressure, stand-still, fallback, report.
+local function Check(dt)
+  reportElapsed = reportElapsed + dt
   Sync()
-  if not inCombat then
+
+  if inCombat then
+    stillFor = 0
+  else
+    if hasSpeed then
+      local speed = GetUnitSpeed("player")
+      local falling = IsFalling and IsFalling()
+      if speed == 0 and not falling then stillFor = stillFor + dt else stillFor = 0 end
+    end
+
     local used, threshold = gcinfo()
     if used >= threshold * db.pressurePct / 100 then
       -- the automatic collector is about to fire anyway; do it now, out of combat
       TryCollect("pressure", true)
-    elseif GetTime() - lastGC >= db.maxInterval then
-      TryCollect("idle")
+    elseif hasSpeed and db.stillSeconds > 0 and stillFor >= db.stillSeconds then
+      TryCollect("standing still", false, true)
+    elseif GetTime() - math.max(lastGC, loadTime) >= db.maxInterval then
+      TryCollect("idle", false, true)
     end
   end
 
@@ -300,7 +318,35 @@ frame:SetScript("OnUpdate", function()
     ResetStats(period)
     reportElapsed = 0
   end
-end)
+end
+
+local function OnUpdate()
+  tick = tick + arg1
+  if tick < 1 then return end
+  local dt = tick
+  tick = 0
+  Check(dt)
+end
+
+-- C_Timer callbacks run once per frame from the world tick, outside the
+-- frame OnUpdate walk. Without ClassicAPI, fall back to a frame OnUpdate.
+StartScheduler = function()
+  hasSpeed = type(GetUnitSpeed) == "function"
+  hasTicker = type(C_Timer) == "table" and type(C_Timer.NewTicker) == "function"
+  lastCheck = GetTime()
+  loadTime = lastCheck
+  if hasTicker then
+    frame:SetScript("OnUpdate", nil)
+    C_Timer.NewTicker(1, function()
+      local now = GetTime()
+      local dt = now - lastCheck
+      lastCheck = now
+      Check(dt)
+    end)
+  else
+    frame:SetScript("OnUpdate", OnUpdate)
+  end
+end
 
 ---------------------------------------------------------------------------
 -- /ggc
@@ -314,6 +360,7 @@ local OPTIONS = {
   pressure = "pressurePct",
   headroom = "combatHeadroomMB",
   report = "reportInterval",
+  still = "stillSeconds",
 }
 
 local function PrintStatus()
@@ -324,9 +371,11 @@ local function PrintStatus()
   Msg(format("session: %d collections, %d skipped, freed %.1fmb, avg %dms, worst %dms; %d automatic (%d in combat)",
     total.count, total.skipped, MB(total.freed),
     total.count > 0 and total.ms / total.count or 0, total.worst, total.auto, total.autoCombat))
-  Msg(format("debug=%d interval=%ds maxinterval=%ds garbage=%dmb garbagepct=%d%% pressure=%d%% headroom=%dmb report=%ds",
+  Msg(format("debug=%d interval=%ds maxinterval=%ds garbage=%dmb garbagepct=%d%% pressure=%d%% headroom=%dmb report=%ds still=%ds",
     DebugLevel(), db.minInterval, db.maxInterval, db.minGarbageMB, db.minGarbagePct,
-    db.pressurePct, db.combatHeadroomMB, db.reportInterval))
+    db.pressurePct, db.combatHeadroomMB, db.reportInterval, db.stillSeconds))
+  Msg("ClassicAPI: stand-still " .. (hasSpeed and "on" or "not available") ..
+    ", C_Timer " .. (hasTicker and "on" or "not available (using OnUpdate)"))
 end
 
 SLASH_GENTLEGC1 = "/ggc"
@@ -351,6 +400,6 @@ SlashCmdList["GENTLEGC"] = function(msg)
     Msg(cmd .. " = " .. val)
   else
     Msg("/ggc [status] | now | debug [0-2] | reset")
-    Msg("/ggc interval|maxinterval|report <sec>  garbage|headroom <mb>  garbagepct|pressure <%>")
+    Msg("/ggc interval|maxinterval|report|still <sec>  garbage|headroom <mb>  garbagepct|pressure <%>")
   end
 end

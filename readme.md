@@ -1,4 +1,4 @@
-Gentle Garbage Collection — unified edition (v2.0)
+Gentle Garbage Collection — unified edition (v2.1)
 ---
 For OctoWoW and other Turtle WoW–based 1.12 clients (Lua 5.0).
 
@@ -15,6 +15,9 @@ moments you won't notice.
 - Out of combat, early, when memory is close to the point where the automatic
   collector would fire anyway, so the next pull starts with room to spare.
 - Fallback: every 5 minutes out of combat.
+- With the ClassicAPI client mod installed: after you've stood still for
+  3 seconds out of combat. When the camera isn't moving, a hitch is much
+  harder to notice. GentleGC detects ClassicAPI and works the same without it.
 
 **When it doesn't**
 - Never in combat. On entering combat it also raises the automatic-GC
@@ -29,11 +32,23 @@ moments you won't notice.
 - `/ggc debug 1`: chat summary every 5 minutes. `/ggc debug 2` also prints each collection. `/ggc debug 0` turns it off.
 - `/ggc now`: collect immediately.
 - `/ggc interval|maxinterval|report <sec>`, `/ggc garbage|headroom <mb>`,
-  `/ggc garbagepct|pressure <%>`, `/ggc reset`.
+  `/ggc garbagepct|pressure <%>`, `/ggc still <sec>` (0 turns stand-still
+  collection off), `/ggc reset`.
 - The old `/run ggc_debug = 1` still works.
 
 The best way to shorten the pauses themselves is still to run less addon memory.
 pfQuest, for example, can hold 100 MB while idle.
+
+**Client mods**
+- ClassicAPI: supported, as above. Its once-per-frame timer also runs
+  GentleGC's background check, in place of a frame OnUpdate.
+- SuperWoW and nampower: compatible. Neither offers anything GentleGC needs.
+- UnitXP SP3: compatible. A February 2026 build briefly turned garbage
+  collection off in combat, and the next build removed that.
+
+**Tests** (`tests/`) run on stock Lua 5.0 with stubbed game functions:
+`lua5.0 tests/test_stock.lua GentleGC.lua` (likewise `test_classicapi.lua`
+and `test_combat_auto.lua`). The game never loads them.
 
 Credits: original by MarcelineVQ (Weird Vibes). Event-driven collection from
 jrc13245's fork; separate report timer from TheRealFayz's fork.
