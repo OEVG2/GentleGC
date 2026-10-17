@@ -1,5 +1,5 @@
 --[[
-  GentleGC - unified edition (for OctoWoW / Turtle-based 1.12 clients, Lua 5.0)
+  GentleGC - unified edition (for WoW 1.18.1 clients, Lua 5.0)
 
   Lua 5.0 has no incremental collector: every collection is a full
   stop-the-world mark + sweep, and the automatic collector fires whenever the

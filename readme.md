@@ -1,6 +1,6 @@
 Gentle Garbage Collection — unified edition (v2.2)
 ---
-For OctoWoW and other Turtle WoW–based 1.12 clients (Lua 5.0).
+For WoW 1.18.1 clients (Lua 5.0).
 
 In Lua 5.0 every garbage collection is a full stop-the-world pause, and the
 automatic collector fires whenever addon memory reaches twice what was live
