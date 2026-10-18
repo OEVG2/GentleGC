@@ -1,5 +1,5 @@
--- Collector-ratio tests: simulates a client mod (like wow_turbo) whose collector
--- sets the threshold to 1.25x live instead of Lua 5.0's 2x.
+-- Collector-ratio tests: simulates the 1.12 client's collector, which sets the
+-- threshold to 1.25x live (at least) instead of stock Lua 5.0's 2x.
 -- Run: lua5.0 tests/test_factor.lua GentleGC.lua
 format = string.format
 local now = 1000
@@ -39,6 +39,7 @@ local function fire(e, a1) event, arg1 = e, a1; this = F; F.scripts.OnEvent() en
 fire("ADDON_LOADED", "GentleGC")
 local cmd = SlashCmdList.GENTLEGC
 cmd("debug 2")
+SF = FRAMES[4]
 
 local function count(pat) local n = 0; for _, m in ipairs(log) do if string.find(m, pat) then n = n + 1 end end; return n end
 local function lastMatch(pat) for i = table.getn(log), 1, -1 do if string.find(log[i], pat) then return log[i] end end; return "" end
@@ -46,6 +47,21 @@ local function check(name, c) print((c and "PASS " or "FAIL ") .. name); if not 
 local function tick(sec) local n = sec * 10; for i = 1, n do now = now + 0.1; arg1 = 0.1; this = F; F.scripts.OnUpdate() end end
 local function liveMB() local _, _, v = string.find(lastMatch("heap .* live ~"), "live ~([%d%.]+)mb"); return tonumber(v) end
 local function realLiveMB() local u = gcinfo(); return u / 1024 end
+-- heap creeps toward the threshold over frames (the sampler sees each one),
+-- then the game's collector fires at the threshold
+local SF = FRAMES[4]
+local keepAlive = {}
+local function growToThresholdThenAutoGC()
+  local _, t = gcinfo()
+  local junk = {}
+  local i = 0
+  while gcinfo() < t * 0.98 do
+    for k = 1, 300 do i = i + 1; junk[i] = { i } end
+    if SF then SF.scripts.OnUpdate() end
+  end
+  junk = nil
+  autoGC()
+end
 -- garbage that stays below the 1.25x threshold so Lua never collects on its own
 local function garbage(kb)
   local target = gcinfo() + kb
@@ -56,8 +72,7 @@ end
 
 print("1. automatic GC before GentleGC has measured the ratio")
 now = now + 60
-garbage(512)
-autoGC()
+growToThresholdThenAutoGC()
 tick(1.1)
 check("automatic GC detected", count("automatic GC detected") == 1)
 cmd("status")
@@ -73,12 +88,11 @@ check("skipped: almost no garbage", count("merchant:") == 0)
 print("3. own collection measures the ratio")
 cmd("now")
 cmd("status")
-check("ratio measured as 1.25x", string.find(lastMatch("collector:"), "threshold = 1%.25x live %(measured%)") ~= nil)
+check("ratio measured as 1.25x", string.find(lastMatch("collector:"), "threshold 1%.25x live after the last full collection, lowest 1%.25x") ~= nil)
 check("garbage minimum capped at half the 25% room", string.find(lastMatch("collector:"), "collecting from 12%.5%% garbage") ~= nil)
 
 print("4. automatic GC after measuring: live estimate is right")
-garbage(512)
-autoGC()
+growToThresholdThenAutoGC()
 tick(1.1)
 cmd("status")
 local real = realLiveMB()

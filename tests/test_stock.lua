@@ -100,7 +100,18 @@ print("8b. automatic GC is detected and resynced")
 cmd("debug 2")
 local nAuto = 0
 for _, m in ipairs(log) do if string.find(m, "automatic GC detected") then nAuto = nAuto + 1 end end
-makeGarbage(25)   -- more than the threshold allows: Lua collects on its own
+-- the heap grows frame by frame until Lua collects on its own
+local SF = FRAMES[4]
+local _, t0 = gcinfo()
+local junk = {}
+local t = t0
+while t == t0 do   -- (a local declared inside repeat isn't visible to until in Lua 5.0)
+  for i = 1, 2000 do table.insert(junk, { i }) end
+  if table.getn(junk) > 20000 then junk = {} end
+  SF.scripts.OnUpdate()
+  _, t = gcinfo()
+end
+junk = nil
 update(1.1)
 local nAuto2 = 0
 for _, m in ipairs(log) do if string.find(m, "automatic GC detected") then nAuto2 = nAuto2 + 1 end end

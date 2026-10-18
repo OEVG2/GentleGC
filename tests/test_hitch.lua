@@ -64,6 +64,18 @@ focus = nil
 frames(3)
 
 print("-- freeze containing the game's automatic GC")
+-- the heap creeps up to just below the threshold over normal frames...
+local SF = FRAMES[4]
+do
+  local junk = {}
+  local _, t = gcinfo()
+  while gcinfo() < t * 0.97 do
+    for i = 1, 500 do table.insert(junk, { i }) end
+    SF.scripts.OnUpdate()
+  end
+  junk = nil
+end
+-- ...and the collector fires inside a long frame
 frame(0.6, function()
   local _, t = gcinfo()
   local junk = {}
@@ -74,7 +86,7 @@ frame(0.6, function()
     if table.getn(junk) > 5000 then junk = {} end
   end
 end)
-check("automatic GC identified", string.find(last(), "not run by GentleGC") ~= nil)
+check("automatic GC identified", string.find(last(), "the game's automatic garbage collection") ~= nil)
 frames(3)
 
 print("-- freeze containing a GentleGC collection")
