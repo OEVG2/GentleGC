@@ -3,7 +3,10 @@
 
   Lua 5.0 has no incremental collector: every collection is a full
   stop-the-world mark + sweep, and the automatic collector fires whenever the
-  heap reaches its threshold (2x live memory after the last collection).
+  heap reaches its threshold. Stock Lua 5.0 sets that threshold to 2x live
+  memory after every collection; client mods that replace the collector may
+  use another ratio (wow_turbo uses 1.25x), so GentleGC learns the ratio from
+  its own collections instead of assuming 2x.
   We can't make a single collection cheaper, but we can choose WHEN it happens:
 
     * collect at moments the player won't feel (loading screens, AFK, NPC
@@ -36,7 +39,8 @@ local DEFAULTS = {
   maxInterval      = 300,  -- seconds: out-of-combat fallback collection
   minGarbageMB     = 4,    -- skip a collection that would free less than this...
   minGarbagePct    = 15,   -- ...or less than this % of live memory (the larger wins)
-  pressurePct      = 85,   -- out of combat: collect early once heap reaches this % of threshold
+  pressureRoomPct  = 70,   -- out of combat: collect early once garbage fills this % of the room
+                           -- between live memory and the auto-GC threshold (70 = 85% of a 2x threshold)
   combatHeadroomMB = 32,   -- extra room before auto-GC during combat (0 = off)
   reportInterval   = 300,  -- seconds between debug summaries
   stillSeconds     = 3,    -- ClassicAPI only: collect after standing still this long (0 = off)
@@ -51,6 +55,7 @@ local function ApplyDefaults()
   for k, v in pairs(DEFAULTS) do
     if db[k] == nil then db[k] = v end
   end
+  db.pressurePct = nil   -- replaced by pressureRoomPct in 2.3
 end
 ApplyDefaults()   -- usable immediately; re-run once saved settings load
 
@@ -60,8 +65,12 @@ local lastGC = 0           -- GetTime() of our last collection
 local liveKB = 0           -- heap size right after the last collection (live-data estimate)
 local savedThreshold = nil -- threshold before we raised it for combat
 local knownThreshold = 0   -- last threshold we saw or set (detects automatic GCs)
+local gcFactor = 2         -- auto-GC threshold / live memory after a collection (2 on stock Lua 5.0)
+local gcFactorLearned = false
 do
   local used, threshold = gcinfo()
+  -- before any collection we can only assume the stock 2x ratio; the first
+  -- collection (usually the login loading screen) measures the real one
   liveKB = math.min(used, math.floor(threshold / 2))
   knownThreshold = threshold
 end
@@ -120,14 +129,21 @@ local function GarbageKB()
   return gcinfo() - liveKB
 end
 
--- Lua 5.0 resets the threshold to exactly 2x live memory after every
--- collection. If the threshold changed and we didn't change it, the automatic
--- collector ran (a pause we didn't schedule): resync our live estimate.
+-- After every collection the threshold is reset to gcFactor x live memory.
+-- If the threshold changed and we didn't change it, the automatic collector
+-- ran (a pause we didn't schedule): resync our live estimate. Until one of our
+-- own collections has measured gcFactor, use the current heap size instead:
+-- it slightly overestimates live memory, which can only make us skip a
+-- marginal collection, never run a useless one.
 local function Sync()
   local used, threshold = gcinfo()
   if threshold ~= knownThreshold then
     if knownThreshold ~= 0 then
-      liveKB = math.floor(threshold / 2)
+      if gcFactorLearned then
+        liveKB = math.min(used, math.floor(threshold / gcFactor))
+      else
+        liveKB = used
+      end
       for _, s in ipairs({ period, total }) do
         s.auto = s.auto + 1
         if inCombat then s.autoCombat = s.autoCombat + 1 end
@@ -148,10 +164,24 @@ local function Sync()
   end
 end
 
+-- The garbage share at which the automatic collector fires is (gcFactor - 1):
+-- 100% of live on stock, 25% with wow_turbo. Never demand more than half of it.
+local function EffectiveGarbagePct()
+  return math.min(db.minGarbagePct, (gcFactor - 1) * 50)
+end
+
 local function WorthCollecting()
   Sync()
-  local need = math.max(db.minGarbageMB * 1024, liveKB * db.minGarbagePct / 100)
+  local need = math.max(db.minGarbageMB * 1024, liveKB * EffectiveGarbagePct() / 100)
   return GarbageKB() >= need
+end
+
+-- Heap size at which a pressure collection runs: a share of the room between
+-- live memory and the threshold, so it works for any gcFactor.
+local function PressurePointKB(threshold)
+  local room = threshold - liveKB
+  if room <= 0 then return threshold * 0.9 end
+  return liveKB + room * db.pressureRoomPct / 100
 end
 
 ---------------------------------------------------------------------------
@@ -162,11 +192,20 @@ local function Collect(reason)
   Sync()
   local before = gcinfo()
   local t0 = StartTimer()
-  collectgarbage()               -- full collection; threshold resets to 2x live
+  collectgarbage()               -- full collection; threshold resets to gcFactor x live
   local ms = StopTimer(t0)
   local after, threshold = gcinfo()
 
   liveKB = after
+  -- learn the collector's ratio; a full collection always sets a fresh
+  -- threshold, never our raised combat one. Ignore implausible readings.
+  if after > 1024 then
+    local f = threshold / after
+    if f > 1.05 and f <= 2.5 then
+      gcFactor = f
+      gcFactorLearned = true
+    end
+  end
   knownThreshold = threshold
   lastGC = GetTime()
   savedThreshold = nil           -- collectgarbage() already set a fresh threshold
@@ -311,9 +350,10 @@ local function Check(dt)
     end
 
     local used, threshold = gcinfo()
-    if used >= threshold * db.pressurePct / 100 then
-      -- the automatic collector is about to fire anyway; do it now, out of combat
-      TryCollect("pressure", true)
+    if used >= PressurePointKB(threshold) and GetTime() - lastGC >= 5 then
+      -- The automatic collector is about to fire anyway and would cost the
+      -- same pause, so collect now, out of combat, without the garbage minimum.
+      Collect("pressure")
     elseif hasSpeed and db.stillSeconds > 0 and stillFor >= db.stillSeconds then
       TryCollect("standing still", false, true)
     elseif GetTime() - math.max(lastGC, loadTime) >= db.maxInterval then
@@ -374,6 +414,12 @@ end
 --   * no collection at all: the freeze came from something else
 -- plus how much Lua memory was allocated during it and which frame was
 -- under the mouse (the window being dragged, usually).
+--
+-- It also records every game event (RegisterAllEvents) into a fixed ring
+-- buffer: name, first argument, time and Lua memory, assigning numbers and
+-- existing values only, so nothing is allocated per event. A report lists
+-- the events that fired during the freeze and where the time went: the
+-- longest gap between them, and the event the biggest memory jump followed.
 ---------------------------------------------------------------------------
 
 local hitchFrame = CreateFrame("Frame")
@@ -382,6 +428,100 @@ local hPrevCollectSeq, hPrevThresholdSeq = 0, 0
 local hLoading, hSkip = false, 0
 local hitchLog = {}   -- last 10 freezes, newest last
 local HITCH_LOG_SIZE = 10
+
+-- event ring buffer
+local EV_N = 64
+local evFrame = CreateFrame("Frame")
+local evName, evArg, evTime, evMem = {}, {}, {}, {}
+local evPos, evSeq = 0, 0          -- last written slot, events recorded so far
+local hFrameStartSeq = 0           -- evSeq at the previous OnUpdate
+local hasAllEvents = evFrame.RegisterAllEvents ~= nil
+
+local function EvOnEvent()
+  evSeq = evSeq + 1
+  evPos = evPos + 1
+  if evPos > EV_N then evPos = 1 end
+  evName[evPos] = event
+  evArg[evPos] = arg1
+  evTime[evPos] = GetTime()
+  evMem[evPos] = gcinfo()
+end
+
+local function ArgText(a)
+  local t = type(a)
+  if t == "string" then
+    if string.len(a) > 24 then a = string.sub(a, 1, 24) .. "..." end
+    return " (" .. a .. ")"
+  elseif t == "number" then
+    return " (" .. a .. ")"
+  end
+  return ""
+end
+
+-- Describe the events recorded after event number startSeq.
+-- frameStart/frameEnd: GetTime() at the two OnUpdates; memStart/memEnd: gcinfo() then.
+local function EventReport(startSeq, frameStart, frameEnd, memStart, memEnd)
+  if not hasAllEvents then return "" end
+  local n = evSeq - startSeq
+  if n <= 0 then return "; no game events fired during it" end
+  local kept = n
+  if kept > EV_N then kept = EV_N end
+
+  -- slots oldest -> newest
+  local first = evPos - kept + 1
+  if first < 1 then first = first + EV_N end
+
+  local counts, order = {}, {}
+  local bestGap, bestAfter, bestBefore = -1, nil, nil
+  local bestAlloc, bestAllocAfter = 0, nil
+  local prevT, prevM, prevLabel = frameStart, memStart, nil
+  if kept < n then prevT, prevM = nil, nil end   -- start of the frame was lost
+  local i = first
+  for k = 1, kept do
+    local name = evName[i]
+    if not counts[name] then counts[name] = 0; table.insert(order, name) end
+    counts[name] = counts[name] + 1
+    local label = name .. ArgText(evArg[i])
+    if prevT then
+      local g = evTime[i] - prevT
+      if g > bestGap then bestGap, bestAfter, bestBefore = g, prevLabel, label end
+      local a = evMem[i] - prevM
+      if a > bestAlloc then bestAlloc, bestAllocAfter = a, prevLabel or "frame start" end
+    end
+    prevT, prevM, prevLabel = evTime[i], evMem[i], label
+    i = i + 1
+    if i > EV_N then i = 1 end
+  end
+  local g = frameEnd - prevT
+  if g > bestGap then bestGap, bestAfter, bestBefore = g, prevLabel, nil end
+  local a = memEnd - prevM
+  if a > bestAlloc then bestAlloc, bestAllocAfter = a, prevLabel end
+
+  table.sort(order, function(x, y) return counts[x] > counts[y] end)
+  local parts = {}
+  for k = 1, math.min(4, table.getn(order)) do
+    local nm = order[k]
+    table.insert(parts, counts[nm] > 1 and (nm .. " x" .. counts[nm]) or nm)
+  end
+  if table.getn(order) > 4 then table.insert(parts, "...") end
+
+  local text = format("; %d event%s: %s", n, n == 1 and "" or "s", table.concat(parts, ", "))
+  if kept < n then text = text .. format(" (last %d kept)", kept) end
+
+  local where
+  if not bestAfter then
+    where = "before the first event"
+  elseif not bestBefore then
+    where = "after " .. bestAfter .. ", the last event"
+  else
+    where = "after " .. bestAfter
+  end
+  text = text .. format("; longest gap %.2fs %s", bestGap, where)
+  if bestAlloc > 1024 then
+    text = text .. format("; %.1fmb allocated after %s", MB(bestAlloc), bestAllocAfter)
+  end
+  return text
+end
 
 local function FocusName()
   if not GetMouseFocus then return nil end
@@ -403,17 +543,20 @@ local function HitchReset()
   hPrevTime = GetTime()
   hPrevUsed, hPrevThreshold = gcinfo()
   hPrevCollectSeq, hPrevThresholdSeq = ownCollectSeq, ownThresholdSeq
+  hFrameStartSeq = evSeq
 end
 
 local function HitchOnUpdate()
   local now = GetTime()
   local used, threshold = gcinfo()
   local gap = now - hPrevTime
-  local prevUsed, prevThreshold = hPrevUsed, hPrevThreshold
+  local prevTime, prevUsed, prevThreshold = hPrevTime, hPrevUsed, hPrevThreshold
+  local startSeq = hFrameStartSeq
   local weCollected = ownCollectSeq ~= hPrevCollectSeq
   local weMovedThreshold = ownThresholdSeq ~= hPrevThresholdSeq
   hPrevTime, hPrevUsed, hPrevThreshold = now, used, threshold
   hPrevCollectSeq, hPrevThresholdSeq = ownCollectSeq, ownThresholdSeq
+  hFrameStartSeq = evSeq
 
   if hLoading then return end
   if hSkip > 0 then hSkip = hSkip - 1; return end
@@ -436,7 +579,9 @@ local function HitchOnUpdate()
   local where = focus and ("; mouse over " .. focus) or ""
   local combat = inCombat and " (in combat)" or ""
 
-  local line = format("freeze %.2fs%s: %s%s%s", gap, combat, cause, alloc, where)
+  local events = EventReport(startSeq, prevTime, now, prevUsed, used)
+
+  local line = format("freeze %.2fs%s: %s%s%s%s", gap, combat, cause, alloc, where, events)
   Msg("|cffff8888" .. line .. "|r")
 
   table.insert(hitchLog, format("%s %s", date and date("%H:%M:%S") or format("%.0f", now), line))
@@ -457,8 +602,16 @@ HitchEnable = function()
     HitchReset()
     hSkip = 1
     hitchFrame:SetScript("OnUpdate", HitchOnUpdate)
+    if hasAllEvents then
+      evFrame:SetScript("OnEvent", EvOnEvent)
+      evFrame:RegisterAllEvents()
+    end
   else
     hitchFrame:SetScript("OnUpdate", nil)
+    if hasAllEvents then
+      evFrame:UnregisterAllEvents()
+      evFrame:SetScript("OnEvent", nil)
+    end
   end
 end
 
@@ -471,7 +624,7 @@ local OPTIONS = {
   maxinterval = "maxInterval",
   garbage = "minGarbageMB",
   garbagepct = "minGarbagePct",
-  pressure = "pressurePct",
+  pressure = "pressureRoomPct",
   headroom = "combatHeadroomMB",
   report = "reportInterval",
   still = "stillSeconds",
@@ -482,12 +635,15 @@ local function PrintStatus()
   local used, threshold = gcinfo()
   Msg(format("heap %.1fmb, auto-GC at %.1fmb, live ~%.1fmb, garbage ~%.1fmb%s",
     MB(used), MB(threshold), MB(liveKB), MB(GarbageKB()), inCombat and " (in combat)" or ""))
+  Msg(format("collector: threshold = %.2fx live (%s); collecting from %.1f%% garbage, pressure at %.1fmb",
+    gcFactor, gcFactorLearned and "measured" or "stock value, not measured yet",
+    EffectiveGarbagePct(), MB(PressurePointKB(threshold))))
   Msg(format("session: %d collections, %d skipped, freed %.1fmb, avg %dms, worst %dms; %d automatic (%d in combat)",
     total.count, total.skipped, MB(total.freed),
     total.count > 0 and total.ms / total.count or 0, total.worst, total.auto, total.autoCombat))
   Msg(format("debug=%d interval=%ds maxinterval=%ds garbage=%dmb garbagepct=%d%% pressure=%d%% headroom=%dmb report=%ds still=%ds",
     DebugLevel(), db.minInterval, db.maxInterval, db.minGarbageMB, db.minGarbagePct,
-    db.pressurePct, db.combatHeadroomMB, db.reportInterval, db.stillSeconds))
+    db.pressureRoomPct, db.combatHeadroomMB, db.reportInterval, db.stillSeconds))
   Msg(db.hitchMs > 0 and ("freeze detector: on (" .. db.hitchMs .. "ms)") or "freeze detector: off (/ggc hitch)")
   Msg("ClassicAPI: stand-still " .. (hasSpeed and "on" or "not available") ..
     ", C_Timer " .. (hasTicker and "on" or "not available (using OnUpdate)"))
