@@ -1,6 +1,12 @@
-Gentle Garbage Collection — unified edition (v2.4)
+Gentle Garbage Collection — unified edition (v2.5)
 ---
 For WoW 1.18.1 clients (Lua 5.0).
+
+**Install**: unzip into `Interface/AddOns`. The zip has two folders:
+`GentleGC` (the addon) and `!!!!GentleGC_Memory` (optional, per-addon memory;
+see below). Keep both folder names exactly as they are. If you download the
+repository instead, move `!!!!GentleGC_Memory` out of the `GentleGC` folder
+so it sits next to it in `Interface/AddOns`.
 
 In Lua 5.0 every garbage collection is a full stop-the-world pause, and the
 automatic collector fires whenever addon memory reaches a threshold, which
@@ -49,6 +55,8 @@ under 75 ms. `/ggc slow <ms>` sets the limit; `/ggc slow 0` turns it off.
   and whether careful mode is on; and how fast garbage is being created.
 - `/ggc debug 1`: chat summary every 5 minutes. `/ggc debug 2` also prints each collection. `/ggc debug 0` turns it off.
 - `/ggc now`: collect immediately.
+- `/ggc addons`: memory per addon (needs `!!!!GentleGC_Memory`). `/ggc addons all`
+  lists every addon; `/ggc addons measure` measures again on the next `/reload`.
 - `/ggc interval|maxinterval|report <sec>`, `/ggc garbage|headroom <mb>`,
   `/ggc garbagepct <%>`, `/ggc pressure <%>` (share of the room, default 70),
   `/ggc slow <ms>` (careful mode, default 100), `/ggc allocwarn <MB/s>`
@@ -73,6 +81,26 @@ under 75 ms. `/ggc slow <ms>` sets the limit; `/ggc slow 0` turns it off.
 - Loading screens are ignored. While on, the detector records each event
   into a fixed 64-slot buffer and reads the clock and memory counter once
   per frame, allocating nothing until it has a freeze to report.
+
+**Per-addon memory** (`/ggc addons`): the 1.12 client has no per-addon
+memory numbers, only the size of the whole Lua heap. The optional
+`!!!!GentleGC_Memory` folder loads before every other addon (that's what the
+`!!!!` is for) and, each time another addon finishes loading, collects garbage
+and reads the heap. The rise is what that addon kept: its code, data and
+saved variables. It only measures at the loading screen, where the extra
+collections can't be seen, and only:
+- on the first login after you install it,
+- when the set of enabled addons has changed since the last measurement,
+- on the next `/reload` after `/ggc addons measure`.
+
+After a measurement Gentle GC prints the three biggest addons. `/ggc addons`
+lists the top 15 (`/ggc addons all` for every one), what was set up at
+login, and how much live memory has grown since. Limits: setup an addon does
+in its own load handler is counted with the next addon; addons loaded before
+the companion (other `!!!!` folders) are counted with the game's own
+interface and listed; load-on-demand addons that load during play aren't
+measured. Same approach as Salahaja's AddonMemory; use one or the other,
+since both together collect twice per addon.
 
 **Other addons' collections**: GentleGC wraps the global `collectgarbage`,
 so when another addon runs a collection (for example a "free memory after
@@ -107,7 +135,10 @@ pfQuest, for example, can hold 100 MB while idle.
 `lua5.0 tests/test_stock.lua GentleGC.lua` (likewise `test_classicapi.lua`,
 `test_combat_auto.lua`, `test_hitch.lua`, `test_factor.lua`, which
 simulates the client's 1.25x collector, and `test_raid.lua`, which covers
-careful mode, other addons' collections and the garbage rate). The game never loads them.
+careful mode, other addons' collections and the garbage rate), and
+`test_memory.lua`, which replays a login for the per-addon measurement
+(`lua5.0 tests/test_memory.lua GentleGC.lua "!!!!GentleGC_Memory/GentleGC_Memory.lua"`). The game never loads them.
 
 Credits: original by MarcelineVQ (Weird Vibes). Event-driven collection from
-jrc13245's fork; separate report timer from TheRealFayz's fork.
+jrc13245's fork; separate report timer from TheRealFayz's fork. Per-addon
+measurement method from Salahaja's AddonMemory (MIT).

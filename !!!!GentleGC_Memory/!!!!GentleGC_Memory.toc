@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: Gentle GC - Memory
+## Notes: Measures how much memory each addon keeps, at the loading screen. Results: /ggc addons (needs Gentle GC)
+## Author: GentleGC contributors
+## Version: 2.5
+## SavedVariables: GentleGCMemoryDB
+
+GentleGC_Memory.lua

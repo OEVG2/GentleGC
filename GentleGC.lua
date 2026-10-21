@@ -31,6 +31,8 @@
     * careful mode: no stand-still or idle collections, only loading screens,
       death, taxi, NPC windows, AFK, after combat, and pressure
   diagnostics:
+    * per-addon memory, measured at the loading screen by the optional
+      !!!!GentleGC_Memory companion (it has to load before other addons)
     * collections run by other addons are timed and attributed by name
     * garbage creation rate (MB/s), with a warning when it is very high
     * /ggc hitch: report frames that take too long, and whether a garbage
@@ -105,6 +107,7 @@ local ownThresholdSeq = 0                  -- bumped when we change the threshol
 local EnterCombatThreshold    -- defined below, used by Sync()
 local StartScheduler          -- defined below, called on ADDON_LOADED
 local HitchLoading, HitchEnable -- freeze detector, defined below
+local ShowAddonSummary        -- per-addon memory, defined below
 
 local function NewStats() return { count = 0, freed = 0, skipped = 0, ms = 0, worst = 0, auto = 0, autoCombat = 0, ext = 0, extCombat = 0 } end
 local period, total = NewStats(), NewStats()
@@ -212,6 +215,13 @@ local function Sync()
   local oldThreshold = knownThreshold
   knownThreshold = threshold
   if oldThreshold == 0 then Account(used); return end
+
+  if used < lastUsed - 1024 and GentleGCMemory and GentleGCMemory.measuring then
+    -- the memory companion collecting between addons at the loading screen
+    liveKB = used
+    lastUsed = used
+    return
+  end
 
   if used < lastUsed - 1024 then
     local est = used
@@ -488,6 +498,10 @@ frame:SetScript("OnEvent", function()
     LeaveCombat()
   elseif event == "PLAYER_LEAVING_WORLD" or event == "PLAYER_ENTERING_WORLD" then
     HitchLoading(event == "PLAYER_LEAVING_WORLD")
+    if event == "PLAYER_ENTERING_WORLD" and GentleGCMemory and GentleGCMemory.justMeasured then
+      GentleGCMemory.justMeasured = false
+      ShowAddonSummary()
+    end
     inCombat = UnitAffectingCombat("player") and true or false
     TryCollect("loading screen", true)
   elseif event == "PLAYER_FLAGS_CHANGED" then
@@ -805,6 +819,91 @@ HitchEnable = function()
 end
 
 ---------------------------------------------------------------------------
+-- per-addon memory (measured by the !!!!GentleGC_Memory companion)
+---------------------------------------------------------------------------
+
+local COMPANION = "!!!!GentleGC_Memory"
+local ADDONS_TOP = 15
+
+local function Size(kb)
+  if kb < 0 then return "-" .. Size(-kb) end
+  if kb < 1024 then return format("%d KB", kb) end
+  return format("%.1f MB", kb / 1024)
+end
+
+local function Measurement()
+  return type(GentleGCMemoryDB) == "table" and GentleGCMemoryDB.measured or nil
+end
+
+local function SortedRows(m)
+  local rows = {}
+  for i = 1, table.getn(m.rows) do table.insert(rows, m.rows[i]) end
+  table.sort(rows, function(a, b) return a[2] > b[2] end)
+  return rows
+end
+
+local function Biggest(m, n)
+  local rows, parts = SortedRows(m), {}
+  for i = 1, math.min(n, table.getn(rows)) do
+    table.insert(parts, rows[i][1] .. " " .. Size(rows[i][2]))
+  end
+  return table.concat(parts, ", ")
+end
+
+ShowAddonSummary = function()
+  local m = Measurement()
+  if not m then return end
+  Msg(format("measured your addons at this loading screen: %s in %d addons. Biggest: %s. /ggc addons lists them all.",
+    Size(m.total or 0), table.getn(m.rows), Biggest(m, 3)))
+end
+
+local function PrintAddons(all)
+  if not GentleGCMemory then
+    Msg("per-addon memory needs the " .. COMPANION .. " folder from the Gentle GC zip in Interface/AddOns. "
+      .. "It has to load before your other addons, which is what the !!!! is for.")
+    return
+  end
+  local m = Measurement()
+  if not m or table.getn(m.rows) == 0 then
+    Msg("no per-addon measurement yet: /ggc addons measure, then /reload.")
+    return
+  end
+  local rows = SortedRows(m)
+  Msg(format("addon memory at login on %s: your addons kept %s; the game's own interface %s.",
+    m.when or "?", Size(m.total or 0), Size(m.base or 0)))
+  local shown = table.getn(rows)
+  if not all and shown > ADDONS_TOP then shown = ADDONS_TOP end
+  for i = 1, shown do
+    DEFAULT_CHAT_FRAME:AddMessage(format("   %9s  %s", Size(rows[i][2]), rows[i][1]))
+  end
+  if shown < table.getn(rows) then
+    DEFAULT_CHAT_FRAME:AddMessage(format("   ...and %d more (/ggc addons all)", table.getn(rows) - shown))
+  end
+  for i = 1, table.getn(m.stages or {}) do
+    DEFAULT_CHAT_FRAME:AddMessage(format("   then %s: %s", m.stages[i][1], Size(m.stages[i][2])))
+  end
+  if m.before and table.getn(m.before) > 0 then
+    DEFAULT_CHAT_FRAME:AddMessage("   loaded before the measurement, so counted in the interface number: "
+      .. table.concat(m.before, ", "))
+  end
+  -- if the client held its load events back, one row gets everything
+  if rows[1] and (m.total or 0) > 10240 and rows[1][2] > m.total * 0.8 and table.getn(rows) > 3 then
+    Msg("one addon got almost all of it: this client may send its load events late, so the split may not be per addon.")
+  end
+  local grown = liveKB - (m.after or liveKB)
+  Msg(format("live memory now ~%s, %s%s since that measurement.", Size(liveKB), grown >= 0 and "+" or "", Size(grown)))
+end
+
+local function MeasureNext()
+  if not GentleGCMemory or type(GentleGCMemoryDB) ~= "table" then
+    PrintAddons(false)   -- explains the missing companion
+    return
+  end
+  GentleGCMemoryDB.measureNext = true
+  Msg("type /reload to measure every addon. The loading screen takes a little longer, once.")
+end
+
+---------------------------------------------------------------------------
 -- /ggc
 ---------------------------------------------------------------------------
 
@@ -857,6 +956,10 @@ local function PrintStatus()
   Msg(format("debug=%d interval=%ds maxinterval=%ds garbage=%dmb garbagepct=%d%% pressure=%d%% headroom=%dmb report=%ds still=%ds slow=%dms allocwarn=%dmb",
     DebugLevel(), db.minInterval, db.maxInterval, db.minGarbageMB, db.minGarbagePct,
     db.pressureRoomPct, db.combatHeadroomMB, db.reportInterval, db.stillSeconds, db.slowMs, db.allocWarnMB))
+  local m = Measurement()
+  if m and table.getn(m.rows) > 0 then
+    Msg(format("biggest addons (measured %s): %s - /ggc addons", m.when or "?", Biggest(m, 3)))
+  end
   Msg(db.hitchMs > 0 and ("freeze detector: on (" .. db.hitchMs .. "ms)") or "freeze detector: off (/ggc hitch)")
   Msg("ClassicAPI: stand-still " .. (hasSpeed and "on" or "not available") ..
     ", C_Timer " .. (hasTicker and "on" or "not available (using OnUpdate)"))
@@ -886,6 +989,12 @@ SlashCmdList["GENTLEGC"] = function(msg)
     else
       Msg("freeze detector off")
     end
+  elseif cmd == "addons" then
+    if val == "measure" then
+      MeasureNext()
+    else
+      PrintAddons(val == "all")
+    end
   elseif cmd == "hitches" then
     if table.getn(hitchLog) == 0 then
       Msg(db.hitchMs > 0 and "no freezes recorded this session" or "freeze detector is off - /ggc hitch to turn it on")
@@ -900,7 +1009,7 @@ SlashCmdList["GENTLEGC"] = function(msg)
     db[OPTIONS[cmd]] = tonumber(val)
     Msg(cmd .. " = " .. val)
   else
-    Msg("/ggc [status] | now | debug [0-2] | hitch [ms] | hitches | reset")
+    Msg("/ggc [status] | now | debug [0-2] | addons [all|measure] | hitch [ms] | hitches | reset")
     Msg("/ggc interval|maxinterval|report|still <sec>  garbage|headroom|allocwarn <mb>  garbagepct|pressure <%>  slow <ms>")
   end
 end
